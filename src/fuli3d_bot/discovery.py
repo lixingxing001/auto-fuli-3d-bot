@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
+from heapq import heappop, heappush
 from math import erfc, exp, log1p, sqrt
 from pathlib import Path
 
@@ -73,6 +74,7 @@ class DiscoveredFormula:
     name: str
     expression: str
     window: int
+    top_n: int
     weights: FormulaWeights
     train: SegmentMetrics
     validation: SegmentMetrics
@@ -90,13 +92,16 @@ class DiscoverySummary:
     latest_number: str
     min_history: int
     windows: list[int]
+    top_values: list[int]
     formulas_searched: int
+    formula_evaluations: int
     train_rounds: int
     validation_rounds: int
     test_rounds: int
     alpha: float
     validation_adjusted_alpha: float
     selected_formula: str
+    selected_top_n: int
     selected_expression: str
     selected_validation_hits: int
     selected_validation_expected_hits: float
@@ -118,6 +123,7 @@ class DiscoveryReport:
 @dataclass(frozen=True)
 class _FormulaCounts:
     weights: FormulaWeights
+    top_n: int
     train_hits: int
     validation_hits: int
     test_hits: int
@@ -293,6 +299,66 @@ def _predict_number(
     return "".join(predicted_digits)
 
 
+def _position_digit_scores(
+    components: list[list[tuple[float, float, float, float, float, float, float]]],
+    weights: FormulaWeights,
+) -> list[list[tuple[int, float]]]:
+    rows: list[list[tuple[int, float]]] = []
+    for position_components in components:
+        scored_digits = []
+        for digit, values in enumerate(position_components):
+            score = (
+                values[0] * weights.hot
+                + values[1] * weights.transition
+                + values[2] * weights.sum_link
+                + values[3] * weights.span_link
+                + values[4] * weights.pattern_link
+                + values[5] * weights.omission
+                + values[6] * weights.repeat
+            )
+            scored_digits.append((digit, score))
+        scored_digits.sort(key=lambda item: (-item[1], item[0]))
+        rows.append(scored_digits)
+    return rows
+
+
+def _ranked_numbers(
+    components: list[list[tuple[float, float, float, float, float, float, float]]],
+    weights: FormulaWeights,
+    top_n: int,
+) -> list[str]:
+    if top_n <= 0:
+        raise ValueError("top_n must be positive")
+    scored_positions = _position_digit_scores(components, weights)
+    heap: list[tuple[float, tuple[int, int, int], tuple[int, int, int]]] = []
+    start = (0, 0, 0)
+    start_digits = tuple(scored_positions[position][0][0] for position in range(3))
+    start_score = sum(scored_positions[position][0][1] for position in range(3))
+    heappush(heap, (-start_score, start_digits, start))
+    seen = {start}
+    ranked: list[str] = []
+    while heap and len(ranked) < top_n:
+        _negative_score, digits, indexes = heappop(heap)
+        ranked.append("".join(str(digit) for digit in digits))
+        for position in range(3):
+            next_indexes = list(indexes)
+            next_indexes[position] += 1
+            next_tuple = tuple(next_indexes)  # type: ignore[arg-type]
+            if next_tuple in seen or next_indexes[position] >= len(scored_positions[position]):
+                continue
+            seen.add(next_tuple)
+            next_digits = tuple(
+                scored_positions[pos][next_tuple[pos]][0]
+                for pos in range(3)
+            )
+            next_score = sum(
+                scored_positions[pos][next_tuple[pos]][1]
+                for pos in range(3)
+            )
+            heappush(heap, (-next_score, next_digits, next_tuple))
+    return ranked
+
+
 def generate_formula_weights(windows: list[int]) -> list[FormulaWeights]:
     formulas: list[FormulaWeights] = []
     for window in windows:
@@ -338,37 +404,43 @@ def _evaluate_window_formulas(
     min_history: int,
     train_rounds: int,
     validation_rounds: int,
+    top_values: list[int],
 ) -> list[_FormulaCounts]:
+    max_top = max(top_values)
     counts = {
-        formula.name: [0, 0, 0, 0]
+        (formula.name, top_n): [0, 0, 0, 0]
         for formula in formulas
+        for top_n in top_values
     }
     for row_index, draw_index in enumerate(range(min_history, len(draws))):
         components = _window_components(draws, draw_index, window)
         actual = draws[draw_index].number
         segment = _segment_index(row_index, train_rounds, validation_rounds)
         for formula in formulas:
-            prediction = _predict_number(components, formula)
-            if prediction != actual:
-                continue
-            hit_counts = counts[formula.name]
-            if segment == "train":
-                hit_counts[0] += 1
-            elif segment == "validation":
-                hit_counts[1] += 1
-            else:
-                hit_counts[2] += 1
-            hit_counts[3] += 1
+            ranked_numbers = _ranked_numbers(components, formula, max_top)
+            for top_n in top_values:
+                if actual not in ranked_numbers[:top_n]:
+                    continue
+                hit_counts = counts[(formula.name, top_n)]
+                if segment == "train":
+                    hit_counts[0] += 1
+                elif segment == "validation":
+                    hit_counts[1] += 1
+                else:
+                    hit_counts[2] += 1
+                hit_counts[3] += 1
 
     return [
         _FormulaCounts(
             weights=formula,
-            train_hits=counts[formula.name][0],
-            validation_hits=counts[formula.name][1],
-            test_hits=counts[formula.name][2],
-            total_hits=counts[formula.name][3],
+            top_n=top_n,
+            train_hits=counts[(formula.name, top_n)][0],
+            validation_hits=counts[(formula.name, top_n)][1],
+            test_hits=counts[(formula.name, top_n)][2],
+            total_hits=counts[(formula.name, top_n)][3],
         )
         for formula in formulas
+        for top_n in top_values
     ]
 
 
@@ -380,10 +452,15 @@ def _counts_to_formula(
     adjusted_alpha: float,
     alpha: float,
 ) -> DiscoveredFormula:
-    train = _segment_metrics(train_rounds, counts.train_hits)
-    validation = _segment_metrics(validation_rounds, counts.validation_hits)
-    test = _segment_metrics(test_rounds, counts.test_hits)
-    total = _segment_metrics(train_rounds + validation_rounds + test_rounds, counts.total_hits)
+    probability = counts.top_n / RANK_TOTAL
+    train = _segment_metrics(train_rounds, counts.train_hits, probability=probability)
+    validation = _segment_metrics(validation_rounds, counts.validation_hits, probability=probability)
+    test = _segment_metrics(test_rounds, counts.test_hits, probability=probability)
+    total = _segment_metrics(
+        train_rounds + validation_rounds + test_rounds,
+        counts.total_hits,
+        probability=probability,
+    )
     if validation.hits <= validation.expected_hits:
         status = "rejected_on_validation"
         note = "验证段没有超过随机期望。"
@@ -403,6 +480,7 @@ def _counts_to_formula(
         name=counts.weights.name,
         expression=counts.weights.expression,
         window=counts.weights.window,
+        top_n=counts.top_n,
         weights=counts.weights,
         train=train,
         validation=validation,
@@ -425,6 +503,7 @@ def _formula_sort_key(formula: DiscoveredFormula) -> tuple[float, float, int, fl
 def run_formula_discovery(
     draws: list[Draw],
     windows: list[int] | None = None,
+    top_values: list[int] | None = None,
     min_history: int = 300,
     alpha: float = 0.05,
     show_top: int = 20,
@@ -437,11 +516,16 @@ def run_formula_discovery(
     for window in active_windows:
         if window <= 0:
             raise ValueError("windows must be positive")
+    active_top_values = sorted(set(top_values or [1, 3, 5, 10]))
+    for top_n in active_top_values:
+        if not 0 < top_n <= RANK_TOTAL:
+            raise ValueError("top_values must be between 1 and 1000")
 
     total_rounds = len(draws) - min_history
     train_rounds, validation_rounds, test_rounds = _split_sizes(total_rounds)
     formulas = generate_formula_weights(active_windows)
-    adjusted_alpha = alpha / max(1, len(formulas))
+    formula_evaluations = len(formulas) * len(active_top_values)
+    adjusted_alpha = alpha / max(1, formula_evaluations)
     grouped: dict[int, list[FormulaWeights]] = defaultdict(list)
     for formula in formulas:
         grouped[formula.window].append(formula)
@@ -455,6 +539,7 @@ def run_formula_discovery(
             min_history=min_history,
             train_rounds=train_rounds,
             validation_rounds=validation_rounds,
+            top_values=active_top_values,
         )
         evaluated.extend(
             _counts_to_formula(
@@ -478,7 +563,7 @@ def run_formula_discovery(
         verdict = "发现弱候选公式，但没有通过搜索规模修正，风险主要是过拟合。"
     else:
         conclusion_status = "no_valid_formula"
-        verdict = "搜索空间内没有发现能证明优于随机直选的稳定公式。"
+        verdict = "搜索空间内没有发现能证明优于随机覆盖率的稳定公式。"
 
     latest = draws[-1]
     summary = DiscoverySummary(
@@ -488,13 +573,16 @@ def run_formula_discovery(
         latest_number=latest.number,
         min_history=min_history,
         windows=active_windows,
+        top_values=active_top_values,
         formulas_searched=len(formulas),
+        formula_evaluations=formula_evaluations,
         train_rounds=train_rounds,
         validation_rounds=validation_rounds,
         test_rounds=test_rounds,
         alpha=alpha,
         validation_adjusted_alpha=adjusted_alpha,
         selected_formula=selected.name,
+        selected_top_n=selected.top_n,
         selected_expression=selected.expression,
         selected_validation_hits=selected.validation.hits,
         selected_validation_expected_hits=selected.validation.expected_hits,
@@ -558,13 +646,16 @@ def render_discovery_markdown(report: DiscoveryReport, meta: dict) -> str:
         f"* 最新号码: {summary.latest_number}",
         f"* 最小历史窗口: {summary.min_history}",
         f"* 搜索窗口: {', '.join(str(item) for item in summary.windows)}",
+        f"* Top评估: {', '.join(str(item) for item in summary.top_values)}",
         f"* 搜索公式数: {summary.formulas_searched}",
+        f"* 公式评估数: {summary.formula_evaluations}",
         f"* 验证段修正阈值: {summary.validation_adjusted_alpha:.8f}",
         "",
         "## 结论",
         "",
         f"* 结论状态: {summary.conclusion_status}",
         f"* 选中公式: {summary.selected_formula}",
+        f"* 选中TopN: {summary.selected_top_n}",
         f"* 表达式: {summary.selected_expression}",
         f"* 验证命中: {summary.selected_validation_hits}, 期望 {summary.selected_validation_expected_hits:.2f}, p {_format_p(summary.selected_validation_p_value)}",
         f"* 测试命中: {summary.selected_test_hits}, 期望 {summary.selected_test_expected_hits:.2f}, lift {summary.selected_test_lift:.2f}, p {_format_p(summary.selected_test_p_value)}",
@@ -572,13 +663,13 @@ def render_discovery_markdown(report: DiscoveryReport, meta: dict) -> str:
         "",
         "## 候选公式排行榜",
         "",
-        "| 排名 | 名称 | 状态 | 训练 | 验证 | 测试 | 表达式 |",
-        "|---:|---|---|---|---|---|---|",
+        "| 排名 | 名称 | TopN | 状态 | 训练 | 验证 | 测试 | 表达式 |",
+        "|---:|---|---:|---|---|---|---|---|",
     ]
     for index, formula in enumerate(report.top_formulas, start=1):
         lines.append(
             "| "
-            f"{index} | {formula.name} | {formula.status} | "
+            f"{index} | {formula.name} | {formula.top_n} | {formula.status} | "
             f"{_metric_cell(formula.train)} | {_metric_cell(formula.validation)} | "
             f"{_metric_cell(formula.test)} | {formula.expression} |"
         )

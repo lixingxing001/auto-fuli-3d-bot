@@ -702,6 +702,7 @@ def cmd_discover(args: argparse.Namespace) -> int:
     report = run_formula_discovery(
         draws,
         windows=windows,
+        top_values=parse_int_list(args.top_values),
         min_history=args.min_history,
         alpha=args.alpha,
         show_top=args.show_top,
@@ -709,6 +710,7 @@ def cmd_discover(args: argparse.Namespace) -> int:
     meta = {
         "draw_rows": len(draws),
         "windows": windows,
+        "top_values": parse_int_list(args.top_values),
         "min_history": args.min_history,
         "alpha": args.alpha,
         "show_top": args.show_top,
@@ -959,6 +961,7 @@ def build_parser() -> argparse.ArgumentParser:
     discover = subparsers.add_parser("discover", help="自动探索自定义历史公式")
     add_data_argument(discover)
     discover.add_argument("--windows", default="30,60,120,240")
+    discover.add_argument("--top-values", default="1,3,5,10")
     discover.add_argument("--min-history", type=int, default=300)
     discover.add_argument("--alpha", type=float, default=0.05)
     discover.add_argument("--show-top", type=int, default=20)

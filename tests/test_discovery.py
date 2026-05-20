@@ -31,11 +31,13 @@ class FormulaDiscoveryTests(unittest.TestCase):
         report = run_formula_discovery(
             make_transition_draws(120),
             windows=[30],
+            top_values=[1, 3, 5],
             min_history=30,
             show_top=5,
         )
 
         self.assertEqual(report.summary.conclusion_status, "candidate_found")
+        self.assertIn(report.summary.selected_top_n, [1, 3, 5])
         self.assertGreaterEqual(report.summary.selected_test_hits, 15)
         self.assertLess(report.summary.selected_test_p_value, 0.05)
 
@@ -43,6 +45,7 @@ class FormulaDiscoveryTests(unittest.TestCase):
         report = run_formula_discovery(
             make_transition_draws(80),
             windows=[30],
+            top_values=[1, 3],
             min_history=30,
             show_top=3,
         )
