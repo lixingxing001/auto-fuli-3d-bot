@@ -6,6 +6,7 @@ from pathlib import Path
 
 from .features import extract_features
 from .models import Draw
+from .strategy import rank_numbers
 
 
 @dataclass(frozen=True)
@@ -25,6 +26,8 @@ class ReviewRow:
     group_hit: bool
     top3_hit: bool
     top5_hit: bool
+    actual_rank: int | None
+    actual_score: float | None
 
 
 @dataclass(frozen=True)
@@ -38,9 +41,16 @@ class ReviewSummary:
     top5_hits: int
     action_days: int
     action_direct_hits: int
+    ranked: int
+    mean_actual_rank: float | None
+    median_actual_rank: float | None
+    top100_count: int
+    top500_count: int
     direct_hit_rate: float
     group_hit_rate: float
     action_direct_hit_rate: float
+    top100_rate: float
+    top500_rate: float
 
 
 @dataclass(frozen=True)
@@ -71,7 +81,82 @@ def _load_snapshot(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _review_row(payload: dict, actual_by_issue: dict[str, Draw]) -> ReviewRow:
+def _rank_from_saved_ranking(report: dict, actual_number: str) -> tuple[int, float | None] | None:
+    for item in report.get("full_ranking", []):
+        if str(item.get("number")) == actual_number:
+            rank = item.get("rank")
+            if rank is None:
+                return None
+            score = item.get("score")
+            return int(rank), float(score) if score is not None else None
+    return None
+
+
+def _draws_through_issue(draws: list[Draw], source_issue: str) -> list[Draw] | None:
+    for index, draw in enumerate(draws):
+        if draw.issue == source_issue:
+            return draws[: index + 1]
+    return None
+
+
+def _strategy_config_from_snapshot(payload: dict):
+    meta = payload.get("meta", {})
+    report = payload.get("report", {})
+    recent_window = int(meta.get("recent_window", 60))
+    min_history = int(meta.get("min_history", 300))
+    strategy_name = str(
+        report.get("strategy_selection", {}).get("active_name", "baseline")
+    )
+    from .daily import _strategy_variants
+
+    variants = {
+        variant.name: variant.config
+        for variant in _strategy_variants(
+            recent_window=recent_window,
+            min_history=min_history,
+        )
+    }
+    return variants.get(strategy_name, variants["baseline"])
+
+
+def _rank_from_rebuilt_ranking(
+    payload: dict,
+    actual_number: str,
+    draws: list[Draw],
+) -> tuple[int, float | None] | None:
+    report = payload["report"]
+    source_issue = str(report.get("latest_issue", ""))
+    source_draws = _draws_through_issue(draws, source_issue)
+    if source_draws is None:
+        return None
+    try:
+        config = _strategy_config_from_snapshot(payload)
+        recommendations = rank_numbers(source_draws, top_n=1000, config=config)
+    except (KeyError, TypeError, ValueError):
+        return None
+    for item in recommendations:
+        if item.number == actual_number:
+            return item.rank, item.score
+    return None
+
+
+def _actual_rank(
+    payload: dict,
+    actual_number: str,
+    draws: list[Draw],
+) -> tuple[int, float | None] | None:
+    report = payload["report"]
+    saved_rank = _rank_from_saved_ranking(report, actual_number)
+    if saved_rank is not None:
+        return saved_rank
+    return _rank_from_rebuilt_ranking(payload, actual_number, draws)
+
+
+def _review_row(
+    payload: dict,
+    actual_by_issue: dict[str, Draw],
+    draws: list[Draw],
+) -> ReviewRow:
     report = payload["report"]
     issue = str(report["next_issue_hint"])
     primary = str(report["primary"]["number"])
@@ -80,6 +165,7 @@ def _review_row(payload: dict, actual_by_issue: dict[str, Draw]) -> ReviewRow:
     actual_number = actual.number if actual else None
     candidates = [primary, *alternatives]
     status = "pending" if actual is None else "hit" if actual_number == primary else "miss"
+    rank_result = _actual_rank(payload, actual_number, draws) if actual_number else None
 
     action_filter = report.get("action_filter", {})
     confidence_gate = report.get("confidence_gate", {})
@@ -100,7 +186,19 @@ def _review_row(payload: dict, actual_by_issue: dict[str, Draw]) -> ReviewRow:
         group_hit=_same_group(primary, actual_number) if actual_number else False,
         top3_hit=actual_number in candidates[:3] if actual_number else False,
         top5_hit=actual_number in candidates[:5] if actual_number else False,
+        actual_rank=rank_result[0] if rank_result else None,
+        actual_score=rank_result[1] if rank_result else None,
     )
+
+
+def _median(values: list[int]) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return float(ordered[middle])
+    return (ordered[middle - 1] + ordered[middle]) / 2
 
 
 def _summarize(rows: list[ReviewRow]) -> ReviewSummary:
@@ -109,8 +207,16 @@ def _summarize(rows: list[ReviewRow]) -> ReviewSummary:
     direct_hits = sum(1 for row in reviewed_rows if row.direct_hit)
     group_hits = sum(1 for row in reviewed_rows if row.group_hit)
     action_direct_hits = sum(1 for row in action_rows if row.direct_hit)
+    actual_ranks = [
+        row.actual_rank
+        for row in reviewed_rows
+        if row.actual_rank is not None
+    ]
+    top100_count = sum(1 for rank in actual_ranks if rank <= 100)
+    top500_count = sum(1 for rank in actual_ranks if rank <= 500)
     reviewed = len(reviewed_rows)
     action_days = len(action_rows)
+    ranked = len(actual_ranks)
     return ReviewSummary(
         snapshots=len(rows),
         reviewed=reviewed,
@@ -121,16 +227,23 @@ def _summarize(rows: list[ReviewRow]) -> ReviewSummary:
         top5_hits=sum(1 for row in reviewed_rows if row.top5_hit),
         action_days=action_days,
         action_direct_hits=action_direct_hits,
+        ranked=ranked,
+        mean_actual_rank=sum(actual_ranks) / ranked if ranked else None,
+        median_actual_rank=_median(actual_ranks),
+        top100_count=top100_count,
+        top500_count=top500_count,
         direct_hit_rate=direct_hits / reviewed if reviewed else 0.0,
         group_hit_rate=group_hits / reviewed if reviewed else 0.0,
         action_direct_hit_rate=action_direct_hits / action_days if action_days else 0.0,
+        top100_rate=top100_count / ranked if ranked else 0.0,
+        top500_rate=top500_count / ranked if ranked else 0.0,
     )
 
 
 def build_review_report(draws: list[Draw], predictions_dir: str | Path) -> ReviewReport:
     actual_by_issue = {draw.issue: draw for draw in draws}
     rows = [
-        _review_row(_load_snapshot(path), actual_by_issue)
+        _review_row(_load_snapshot(path), actual_by_issue, draws)
         for path in _snapshot_files(predictions_dir)
     ]
     rows.sort(key=lambda row: row.issue)
@@ -159,18 +272,37 @@ def _format_percent(value: float) -> str:
     return f"{value:.2%}"
 
 
+def _format_optional_number(value: float | None) -> str:
+    return "暂无" if value is None else f"{value:.1f}"
+
+
+def _rank_band(rank: int | None) -> str:
+    if rank is None:
+        return "无排名"
+    if rank <= 100:
+        return "前100"
+    if rank <= 500:
+        return "前500"
+    return "后500"
+
+
 def _rows_html(rows: list[ReviewRow]) -> str:
     if not rows:
-        return "<tr><td colspan='10' class='empty'>暂无预测快照</td></tr>"
+        return "<tr><td colspan='11' class='empty'>暂无预测快照</td></tr>"
     html_rows = []
     for row in rows:
         actual = row.actual_number if row.actual_number is not None else "待开奖"
         hit = "命中" if row.direct_hit else "未命中" if row.status != "pending" else "待复盘"
+        actual_rank = f"#{row.actual_rank}" if row.actual_rank is not None else "暂无"
+        actual_score = (
+            f"评分 {row.actual_score:.3f}" if row.actual_score is not None else _rank_band(row.actual_rank)
+        )
         html_rows.append(
             "<tr>"
             f"<td>{row.issue}</td>"
             f"<td><strong>{row.predicted_number}</strong><span>{row.source_issue}</span></td>"
             f"<td>{actual}<span>{row.actual_date or ''}</span></td>"
+            f"<td>{actual_rank}<span>{actual_score}</span></td>"
             f"<td>{row.action_label}<span>{row.stake_level}投入</span></td>"
             f"<td>{row.confidence_label}</td>"
             f"<td>{row.strategy_label}</td>"
@@ -214,7 +346,7 @@ def render_review_html(report: ReviewReport, meta: dict) -> str:
     .topbar .wrap {{ min-height: 72px; display: flex; align-items: center; justify-content: space-between; gap: 16px; }}
     h1 {{ margin: 0; font-size: 22px; }}
     main {{ max-width: 1180px; margin: 0 auto; padding: 24px; }}
-    .grid {{ display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; margin-bottom: 18px; }}
+    .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(135px, 1fr)); gap: 10px; margin-bottom: 18px; }}
     .card, .table-box {{ background: var(--panel); border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 1px 2px rgba(31, 41, 51, 0.05); }}
     .card {{ padding: 14px; min-height: 96px; }}
     .card span, td span {{ display: block; color: var(--muted); font-size: 12px; }}
@@ -227,7 +359,6 @@ def render_review_html(report: ReviewReport, meta: dict) -> str:
     .empty {{ text-align: center; color: var(--muted); }}
     @media (max-width: 900px) {{
       .wrap, main {{ padding-left: 14px; padding-right: 14px; }}
-      .grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
       table {{ font-size: 12px; }}
     }}
   </style>
@@ -246,12 +377,14 @@ def render_review_html(report: ReviewReport, meta: dict) -> str:
     <div class="card"><span>待开奖</span><strong>{summary.pending}</strong></div>
     <div class="card"><span>直选命中率</span><strong>{_format_percent(summary.direct_hit_rate)}</strong></div>
     <div class="card"><span>出手日命中率</span><strong>{_format_percent(summary.action_direct_hit_rate)}</strong></div>
+    <div class="card"><span>平均真实排名</span><strong>{_format_optional_number(summary.mean_actual_rank)}</strong></div>
+    <div class="card"><span>真实号前500</span><strong>{_format_percent(summary.top500_rate)}</strong></div>
   </section>
   <div class="table-box">
     <table>
       <thead>
         <tr>
-          <th>预测期号</th><th>预测号</th><th>开奖号</th><th>出手建议</th><th>置信</th><th>策略</th><th>直选</th><th>组选</th><th>Top3</th><th>Top5</th>
+          <th>预测期号</th><th>预测号</th><th>开奖号</th><th>真实排名</th><th>出手建议</th><th>置信</th><th>策略</th><th>直选</th><th>组选</th><th>Top3</th><th>Top5</th>
         </tr>
       </thead>
       <tbody>{_rows_html(report.rows)}</tbody>

@@ -57,6 +57,16 @@ class DailyPrediction:
 
 
 @dataclass(frozen=True)
+class RankingEntry:
+    rank: int
+    number: str
+    score: float
+    sum_value: int
+    span: int
+    pattern: str
+
+
+@dataclass(frozen=True)
 class PlayStats:
     rounds: int
     hits: int
@@ -166,6 +176,7 @@ class DailyReport:
     confidence_gate: ConfidenceGate
     action_filter: ActionFilter
     strategy_selection: StrategySelection
+    full_ranking: list[RankingEntry]
     source_notes: list[str]
 
 
@@ -185,6 +196,18 @@ def _prediction_from_recommendation(item: Recommendation) -> DailyPrediction:
         span=features.span,
         pattern=pattern_label(features.pattern),
         reasons=item.reasons,
+    )
+
+
+def _ranking_entry_from_recommendation(item: Recommendation) -> RankingEntry:
+    features = item.features
+    return RankingEntry(
+        rank=item.rank,
+        number=item.number,
+        score=item.score,
+        sum_value=features.sum_value,
+        span=features.span,
+        pattern=pattern_label(features.pattern),
     )
 
 
@@ -993,7 +1016,8 @@ def build_daily_report(
         min_history=min_history,
         cache_path=strategy_cache_path,
     )
-    recommendations = rank_numbers(draws, top_n=top_n, config=config)
+    all_recommendations = rank_numbers(draws, top_n=1000, config=config)
+    recommendations = all_recommendations[:top_n]
     latest = draws[-1]
     primary = _prediction_from_recommendation(recommendations[0])
     alternatives = [_prediction_from_recommendation(item) for item in recommendations[1:top_n]]
@@ -1012,6 +1036,10 @@ def build_daily_report(
         confidence_gate=confidence_gate,
         action_filter=action_filter,
         strategy_selection=strategy_selection,
+        full_ranking=[
+            _ranking_entry_from_recommendation(item)
+            for item in all_recommendations
+        ],
         source_notes=[
             "规则和固定奖金以公开规则为准，地方派奖或限额销售不纳入本报告。",
             "奖金表来源: https://mzj.gz.gov.cn/gzfcw/gczn/fcsd/content/post_8631790.html",

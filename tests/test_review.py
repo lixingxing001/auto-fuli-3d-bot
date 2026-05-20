@@ -15,7 +15,18 @@ from fuli3d_bot.models import Draw  # noqa: E402
 from fuli3d_bot.review import build_review_report, save_review_report  # noqa: E402
 
 
-def write_snapshot(path: Path, issue: str, number: str, alternatives: list[str] | None = None) -> None:
+def write_snapshot(
+    path: Path,
+    issue: str,
+    number: str,
+    alternatives: list[str] | None = None,
+    full_ranking: list[dict] | None = None,
+) -> None:
+    ranked_numbers = [number, *(alternatives or [])]
+    saved_ranking = full_ranking or [
+        {"rank": index + 1, "number": item, "score": 1.0 / (index + 1)}
+        for index, item in enumerate(ranked_numbers)
+    ]
     payload = {
         "meta": {"draw_rows": 10},
         "report": {
@@ -24,6 +35,7 @@ def write_snapshot(path: Path, issue: str, number: str, alternatives: list[str] 
             "next_issue_hint": issue,
             "primary": {"number": number},
             "alternatives": [{"number": item} for item in (alternatives or [])],
+            "full_ranking": saved_ranking,
             "action_filter": {"label": "可小注", "stake_level": "低"},
             "confidence_gate": {"label": "可关注"},
             "strategy_selection": {"active_label": "测试策略"},
@@ -45,7 +57,37 @@ class ReviewTests(unittest.TestCase):
             self.assertEqual(report.summary.reviewed, 1)
             self.assertEqual(report.summary.direct_hits, 1)
             self.assertEqual(report.summary.group_hits, 1)
+            self.assertEqual(report.summary.ranked, 1)
+            self.assertEqual(report.summary.mean_actual_rank, 1.0)
+            self.assertEqual(report.summary.top100_count, 1)
+            self.assertEqual(report.rows[0].actual_rank, 1)
             self.assertTrue(report.rows[0].top3_hit)
+
+    def test_review_tracks_actual_rank_for_misses(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            predictions = Path(temp_dir) / "snapshots"
+            predictions.mkdir()
+            write_snapshot(
+                predictions / "prediction_2026130.json",
+                "2026130",
+                "812",
+                ["888", "818"],
+                full_ranking=[
+                    {"rank": 1, "number": "812", "score": 1.0},
+                    {"rank": 750, "number": "267", "score": -0.2},
+                ],
+            )
+            draws = [Draw("2026130", date(2026, 5, 20), "267")]
+
+            report = build_review_report(draws, predictions)
+
+            self.assertEqual(report.rows[0].status, "miss")
+            self.assertEqual(report.rows[0].actual_rank, 750)
+            self.assertEqual(report.rows[0].actual_score, -0.2)
+            self.assertEqual(report.summary.mean_actual_rank, 750.0)
+            self.assertEqual(report.summary.median_actual_rank, 750.0)
+            self.assertEqual(report.summary.top500_count, 0)
+            self.assertEqual(report.summary.top500_rate, 0.0)
 
     def test_review_keeps_pending_when_actual_missing(self) -> None:
         with TemporaryDirectory() as temp_dir:

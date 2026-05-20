@@ -83,8 +83,8 @@ fuli3d --data data/history.csv recommend --top 20
 * `src/fuli3d_bot/variantstress.py`: 权重变体压力测试，按年度和近期窗口复核候选变体
 * `src/fuli3d_bot/delivery.py`: 交付状态汇总，明确当前是否允许进入推荐验收
 * `src/fuli3d_bot/targetcoverage.py`: 目标覆盖率测算，说明达到指定命中率需要覆盖多少号码以及期望亏损
-* `src/fuli3d_bot/daily.py`: 每日预测页面，展示主预测号码、备选号、不同玩法奖金和回测命中率
-* `src/fuli3d_bot/review.py`: 每日预测快照复盘，统计直选、组选、Top3 和 Top5 命中
+* `src/fuli3d_bot/daily.py`: 每日预测页面，展示主预测号码、备选号、不同玩法奖金和回测命中率，并在快照中保存全量号码排名
+* `src/fuli3d_bot/review.py`: 每日预测快照复盘，统计直选、组选、Top3、Top5 命中和实际开奖号全量排名
 * `src/fuli3d_bot/cli.py`: 所有命令行入口
 
 ## 严格边界
