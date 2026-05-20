@@ -50,6 +50,7 @@ python main.py targetcoverage --target-rate 0.65 --limit-rows 1200 --training-wi
 python main.py daily --output-dir reports/daily
 python main.py review --predictions-dir reports/daily/snapshots --output-dir reports/review
 python main.py lawcheck --output-dir reports/lawcheck
+python main.py discover --output-dir reports/formula_discovery
 ```
 
 完整历史实验会明显更慢:
@@ -87,6 +88,7 @@ fuli3d --data data/history.csv recommend --top 20
 * `src/fuli3d_bot/daily.py`: 每日预测页面，展示主预测号码、备选号、不同玩法奖金和回测命中率，并在快照中保存全量号码排名
 * `src/fuli3d_bot/review.py`: 每日预测快照复盘，统计直选、组选、Top3、Top5 命中和实际开奖号全量排名
 * `src/fuli3d_bot/lawcheck.py`: 历史规律数学检验，检查分布、自相关、转移独立性和候选公式留出表现
+* `src/fuli3d_bot/discovery.py`: 自定义公式探索器，在滚动历史特征空间里搜索候选公式并做训练、验证、测试切分
 * `src/fuli3d_bot/cli.py`: 所有命令行入口
 
 ## 严格边界

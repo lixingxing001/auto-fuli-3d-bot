@@ -14,6 +14,7 @@ from .calibration import run_calibration, save_calibration_reports
 from .delivery import build_delivery_report, save_delivery_report
 from .daily import build_daily_report, save_daily_report
 from .experiment import build_cases, parse_int_list, run_experiments, save_experiment_reports
+from .discovery import run_formula_discovery, save_discovery_reports
 from .fetcher import fetch_and_write
 from .features import pattern_label
 from .gate import RuleGateThresholds, run_gate, save_gate_reports
@@ -695,6 +696,36 @@ def cmd_lawcheck(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_discover(args: argparse.Namespace) -> int:
+    draws = _load(args.data)
+    windows = parse_int_list(args.windows)
+    report = run_formula_discovery(
+        draws,
+        windows=windows,
+        min_history=args.min_history,
+        alpha=args.alpha,
+        show_top=args.show_top,
+    )
+    meta = {
+        "draw_rows": len(draws),
+        "windows": windows,
+        "min_history": args.min_history,
+        "alpha": args.alpha,
+        "show_top": args.show_top,
+        "output_dir": args.output_dir,
+    }
+    json_path, md_path = save_discovery_reports(report, args.output_dir, meta)
+    output = {
+        "json": str(json_path),
+        "markdown": str(md_path),
+        "meta": meta,
+        "summary": asdict(report.summary),
+        "top_formulas": [asdict(row) for row in report.top_formulas],
+    }
+    print(json.dumps(output, ensure_ascii=False, indent=2))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="fuli3d",
@@ -924,6 +955,15 @@ def build_parser() -> argparse.ArgumentParser:
     lawcheck.add_argument("--split-ratio", type=float, default=0.7)
     lawcheck.add_argument("--output-dir", default="reports/lawcheck")
     lawcheck.set_defaults(func=cmd_lawcheck)
+
+    discover = subparsers.add_parser("discover", help="自动探索自定义历史公式")
+    add_data_argument(discover)
+    discover.add_argument("--windows", default="30,60,120,240")
+    discover.add_argument("--min-history", type=int, default=300)
+    discover.add_argument("--alpha", type=float, default=0.05)
+    discover.add_argument("--show-top", type=int, default=20)
+    discover.add_argument("--output-dir", default="reports/formula_discovery")
+    discover.set_defaults(func=cmd_discover)
 
     return parser
 
