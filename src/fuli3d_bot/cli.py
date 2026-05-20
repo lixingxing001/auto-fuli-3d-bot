@@ -17,6 +17,7 @@ from .experiment import build_cases, parse_int_list, run_experiments, save_exper
 from .fetcher import fetch_and_write
 from .features import pattern_label
 from .gate import RuleGateThresholds, run_gate, save_gate_reports
+from .lawcheck import run_law_check, save_law_check_reports
 from .repository import load_draws
 from .review import build_review_report, save_review_report
 from .rules import (
@@ -665,6 +666,35 @@ def cmd_review(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_lawcheck(args: argparse.Namespace) -> int:
+    draws = _load(args.data)
+    report = run_law_check(
+        draws,
+        max_lag=args.max_lag,
+        alpha=args.alpha,
+        min_formula_history=args.min_formula_history,
+        split_ratio=args.split_ratio,
+    )
+    meta = {
+        "draw_rows": len(draws),
+        "max_lag": args.max_lag,
+        "alpha": args.alpha,
+        "min_formula_history": args.min_formula_history,
+        "split_ratio": args.split_ratio,
+        "output_dir": args.output_dir,
+    }
+    json_path, md_path = save_law_check_reports(report, args.output_dir, meta)
+    output = {
+        "json": str(json_path),
+        "markdown": str(md_path),
+        "meta": meta,
+        "summary": asdict(report.summary),
+        "formula_tests": [asdict(row) for row in report.formula_tests],
+    }
+    print(json.dumps(output, ensure_ascii=False, indent=2))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="fuli3d",
@@ -885,6 +915,15 @@ def build_parser() -> argparse.ArgumentParser:
     review.add_argument("--predictions-dir", default="reports/daily/snapshots")
     review.add_argument("--output-dir", default="reports/review")
     review.set_defaults(func=cmd_review)
+
+    lawcheck = subparsers.add_parser("lawcheck", help="检验历史开奖是否存在可验证数学规律")
+    add_data_argument(lawcheck)
+    lawcheck.add_argument("--max-lag", type=int, default=10)
+    lawcheck.add_argument("--alpha", type=float, default=0.05)
+    lawcheck.add_argument("--min-formula-history", type=int, default=300)
+    lawcheck.add_argument("--split-ratio", type=float, default=0.7)
+    lawcheck.add_argument("--output-dir", default="reports/lawcheck")
+    lawcheck.set_defaults(func=cmd_lawcheck)
 
     return parser
 
