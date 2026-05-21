@@ -47,7 +47,7 @@ python main.py ablation --limit-rows 1200 --training-window 300 --recent-window 
 python main.py variantstress --variants baseline,no_repeat_penalty --limit-rows 1200 --training-window 300 --recent-window 60 --output-dir reports/variantstress
 python main.py delivery --output-dir reports/delivery
 python main.py targetcoverage --target-rate 0.65 --limit-rows 1200 --training-window 300 --recent-window 60 --output-dir reports/targetcoverage
-python main.py daily --output-dir reports/daily
+python main.py daily --output-dir reports/daily --cooldown-misses 2
 python main.py review --predictions-dir reports/daily/snapshots --output-dir reports/review
 python main.py lawcheck --output-dir reports/lawcheck
 python main.py discover --top-values 1,3,5,10 --output-dir reports/formula_discovery
@@ -85,7 +85,7 @@ fuli3d --data data/history.csv recommend --top 20
 * `src/fuli3d_bot/variantstress.py`: 权重变体压力测试，按年度和近期窗口复核候选变体
 * `src/fuli3d_bot/delivery.py`: 交付状态汇总，明确当前是否允许进入推荐验收
 * `src/fuli3d_bot/targetcoverage.py`: 目标覆盖率测算，说明达到指定命中率需要覆盖多少号码以及期望亏损
-* `src/fuli3d_bot/daily.py`: 每日预测页面，展示主预测号码、备选号、不同玩法奖金和回测命中率，并在快照中保存全量号码排名
+* `src/fuli3d_bot/daily.py`: 每日预测页面，展示主预测号码、备选号、不同玩法奖金和回测命中率，并在快照中保存全量号码排名，连续未中的主号会进入冷却
 * `src/fuli3d_bot/review.py`: 每日预测快照复盘，统计直选、组选、Top3、Top5 命中和实际开奖号全量排名
 * `src/fuli3d_bot/lawcheck.py`: 历史规律数学检验，检查分布、自相关、转移独立性和候选公式留出表现
 * `src/fuli3d_bot/discovery.py`: 自定义公式探索器，在滚动历史特征空间里搜索候选公式，并评估 Top1、Top3、Top5、Top10 的训练、验证、测试表现

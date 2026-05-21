@@ -67,6 +67,26 @@ class RankingEntry:
 
 
 @dataclass(frozen=True)
+class PrimaryCooldownRecord:
+    number: str
+    consecutive_misses: int
+    last_issue: str
+    last_actual_number: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class PrimaryCooldownState:
+    threshold: int
+    reviewed_snapshots: int
+    records: list[PrimaryCooldownRecord]
+
+    @property
+    def active_numbers(self) -> set[str]:
+        return {record.number for record in self.records}
+
+
+@dataclass(frozen=True)
 class PlayStats:
     rounds: int
     hits: int
@@ -177,6 +197,7 @@ class DailyReport:
     action_filter: ActionFilter
     strategy_selection: StrategySelection
     full_ranking: list[RankingEntry]
+    primary_cooldown: PrimaryCooldownState
     source_notes: list[str]
 
 
@@ -208,6 +229,82 @@ def _ranking_entry_from_recommendation(item: Recommendation) -> RankingEntry:
         sum_value=features.sum_value,
         span=features.span,
         pattern=pattern_label(features.pattern),
+    )
+
+
+def _empty_primary_cooldown(threshold: int = 2, reviewed_snapshots: int = 0) -> PrimaryCooldownState:
+    return PrimaryCooldownState(
+        threshold=threshold,
+        reviewed_snapshots=reviewed_snapshots,
+        records=[],
+    )
+
+
+def _snapshot_files(predictions_dir: str | Path) -> list[Path]:
+    path = Path(predictions_dir)
+    if not path.exists():
+        return []
+    return sorted(path.glob("prediction_*.json"))
+
+
+def _safe_load_snapshot(path: Path) -> dict | None:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def build_primary_cooldown_state(
+    draws: list[Draw],
+    predictions_dir: str | Path,
+    threshold: int = 2,
+) -> PrimaryCooldownState:
+    active_threshold = max(1, threshold)
+    actual_by_issue = {draw.issue: draw for draw in draws}
+    reviewed: list[tuple[str, str, str, bool]] = []
+    for path in _snapshot_files(predictions_dir):
+        payload = _safe_load_snapshot(path)
+        if payload is None:
+            continue
+        try:
+            report = payload["report"]
+            issue = str(report["next_issue_hint"])
+            primary = str(report["primary"]["number"])
+        except (KeyError, TypeError):
+            continue
+        actual = actual_by_issue.get(issue)
+        if actual is None:
+            continue
+        reviewed.append((issue, primary, actual.number, primary == actual.number))
+
+    if not reviewed:
+        return _empty_primary_cooldown(active_threshold, 0)
+
+    last_issue, last_primary, last_actual, last_hit = reviewed[-1]
+    if last_hit:
+        return _empty_primary_cooldown(active_threshold, len(reviewed))
+
+    consecutive_misses = 0
+    for _issue, primary, _actual, hit in reversed(reviewed):
+        if primary != last_primary or hit:
+            break
+        consecutive_misses += 1
+
+    if consecutive_misses < active_threshold:
+        return _empty_primary_cooldown(active_threshold, len(reviewed))
+
+    return PrimaryCooldownState(
+        threshold=active_threshold,
+        reviewed_snapshots=len(reviewed),
+        records=[
+            PrimaryCooldownRecord(
+                number=last_primary,
+                consecutive_misses=consecutive_misses,
+                last_issue=last_issue,
+                last_actual_number=last_actual,
+                reason=f"主号连续 {consecutive_misses} 次未命中，暂停作为下一期主号。",
+            )
+        ],
     )
 
 
@@ -658,6 +755,28 @@ def build_action_filter(
     )
 
 
+def apply_primary_cooldown(
+    action_filter: ActionFilter,
+    primary: DailyPrediction,
+    cooldown_state: PrimaryCooldownState,
+) -> ActionFilter:
+    if not cooldown_state.records:
+        return action_filter
+    cooled = "、".join(record.number for record in cooldown_state.records)
+    detail = "；".join(
+        f"{record.number} 连续 {record.consecutive_misses} 次未命中"
+        for record in cooldown_state.records
+    )
+    return ActionFilter(
+        status="observe",
+        label="观望",
+        stake_level="零",
+        recommendation="主号冷却生效，本期只记录，不做直选出手。",
+        reason=f"{detail}，已暂停作为主号。",
+        allowed_scope=f"记录 {primary.number}，冷却观察 {cooled}",
+    )
+
+
 def _strategy_variants(recent_window: int, min_history: int) -> list[StrategyVariant]:
     base = StrategyConfig(recent_window=recent_window, min_history=min_history)
     zero = replace(
@@ -1007,6 +1126,7 @@ def build_daily_report(
     recent_window: int = 60,
     min_history: int = 300,
     strategy_cache_path: str | Path | None = None,
+    primary_cooldown: PrimaryCooldownState | None = None,
 ) -> DailyReport:
     strategy_selection, config, selected_picks = select_daily_strategy(
         draws,
@@ -1017,13 +1137,27 @@ def build_daily_report(
         cache_path=strategy_cache_path,
     )
     all_recommendations = rank_numbers(draws, top_n=1000, config=config)
-    recommendations = all_recommendations[:top_n]
+    cooldown_state = primary_cooldown or _empty_primary_cooldown()
+    cooled_numbers = cooldown_state.active_numbers
+    selected_primary = next(
+        (item for item in all_recommendations if item.number not in cooled_numbers),
+        all_recommendations[0],
+    )
+    recommendations = [
+        item
+        for item in all_recommendations
+        if item.number != selected_primary.number
+    ][: max(0, top_n - 1)]
     latest = draws[-1]
-    primary = _prediction_from_recommendation(recommendations[0])
-    alternatives = [_prediction_from_recommendation(item) for item in recommendations[1:top_n]]
+    primary = _prediction_from_recommendation(selected_primary)
+    alternatives = [_prediction_from_recommendation(item) for item in recommendations]
     play_rows = build_play_rows(primary.number, selected_picks)
     confidence_gate = build_confidence_gate(play_rows)
-    action_filter = build_action_filter(confidence_gate, strategy_selection, play_rows)
+    action_filter = apply_primary_cooldown(
+        build_action_filter(confidence_gate, strategy_selection, play_rows),
+        primary,
+        cooldown_state,
+    )
     return DailyReport(
         latest_issue=latest.issue,
         latest_date=latest.draw_date.isoformat() if latest.draw_date else None,
@@ -1040,6 +1174,7 @@ def build_daily_report(
             _ranking_entry_from_recommendation(item)
             for item in all_recommendations
         ],
+        primary_cooldown=cooldown_state,
         source_notes=[
             "规则和固定奖金以公开规则为准，地方派奖或限额销售不纳入本报告。",
             "奖金表来源: https://mzj.gz.gov.cn/gzfcw/gczn/fcsd/content/post_8631790.html",
@@ -1242,6 +1377,25 @@ def _alternatives_html(items: list[DailyPrediction]) -> str:
             "</tr>"
         )
     return "\n".join(rows)
+
+
+def _cooldown_html(cooldown: PrimaryCooldownState) -> str:
+    if not cooldown.records:
+        return ""
+    rows = "".join(
+        f"<li><strong>{record.number}</strong><span>{record.reason} 最近开奖 {record.last_issue}，实际 {record.last_actual_number}</span></li>"
+        for record in cooldown.records
+    )
+    return f"""
+      <div class="cooldown-strip">
+        <div>
+          <span>主号冷却</span>
+          <strong>已触发</strong>
+          <em>连续 {cooldown.threshold} 次未命中的主号暂停进入主位，只保留观察。</em>
+        </div>
+        <ul>{rows}</ul>
+      </div>
+    """
 
 
 def render_daily_html(report: DailyReport, meta: dict) -> str:
@@ -1500,6 +1654,41 @@ def render_daily_html(report: DailyReport, meta: dict) -> str:
       padding: 6px 10px;
       font-size: 13px;
     }}
+    .cooldown-strip {{
+      display: grid;
+      grid-template-columns: 180px 1fr;
+      gap: 12px;
+      border: 1px solid #d6c28b;
+      border-radius: 8px;
+      background: #fffaf0;
+      padding: 12px;
+      margin-bottom: 12px;
+    }}
+    .cooldown-strip span,
+    .cooldown-strip em,
+    .cooldown-strip li span {{
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      font-style: normal;
+    }}
+    .cooldown-strip strong {{
+      display: block;
+      margin: 4px 0;
+      color: #6f4e08;
+      font-size: 18px;
+    }}
+    .cooldown-strip ul {{
+      display: grid;
+      gap: 8px;
+      list-style: none;
+      margin: 0;
+      padding: 0;
+    }}
+    .cooldown-strip li {{
+      border-left: 3px solid var(--gold);
+      padding-left: 10px;
+    }}
     .gate-checks {{
       display: grid;
       grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -1626,6 +1815,7 @@ def render_daily_html(report: DailyReport, meta: dict) -> str:
       .gate-checks {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
       .action-strip {{ align-items: flex-start; flex-direction: column; }}
       .gate-strip {{ align-items: flex-start; flex-direction: column; }}
+      .cooldown-strip {{ grid-template-columns: 1fr; }}
       .digits span {{ height: 76px; font-size: 44px; }}
       .primary-meta {{ grid-template-columns: 1fr; }}
       .section-title {{ display: block; }}
@@ -1675,6 +1865,7 @@ def render_daily_html(report: DailyReport, meta: dict) -> str:
         </div>
         <b>置信 {gate.confidence}</b>
       </div>
+      {_cooldown_html(report.primary_cooldown)}
       <ul class="gate-checks">{_gate_checks_html(gate)}</ul>
       <div class="summary-grid">{summary_cards}</div>
       <div class="notice">严格结论: {action.reason} {gate.action} 本页用于提高选号纪律和复盘质量，不能把短期命中当成稳定能力。</div>

@@ -12,7 +12,7 @@ from .backtest import run_backtest
 from .baselines import parse_ranker_names
 from .calibration import run_calibration, save_calibration_reports
 from .delivery import build_delivery_report, save_delivery_report
-from .daily import build_daily_report, save_daily_report
+from .daily import build_daily_report, build_primary_cooldown_state, save_daily_report
 from .experiment import build_cases, parse_int_list, run_experiments, save_experiment_reports
 from .discovery import run_formula_discovery, save_discovery_reports
 from .fetcher import fetch_and_write
@@ -615,6 +615,12 @@ def cmd_targetcoverage(args: argparse.Namespace) -> int:
 def cmd_daily(args: argparse.Namespace) -> int:
     draws = _load(args.data)
     strategy_cache_path = Path(args.output_dir) / "strategy_cache.json"
+    predictions_dir = Path(args.output_dir) / "snapshots"
+    primary_cooldown = build_primary_cooldown_state(
+        draws,
+        predictions_dir,
+        threshold=args.cooldown_misses,
+    )
     report = build_daily_report(
         draws,
         top_n=args.top,
@@ -622,6 +628,7 @@ def cmd_daily(args: argparse.Namespace) -> int:
         recent_window=args.recent_window,
         min_history=args.min_history,
         strategy_cache_path=strategy_cache_path,
+        primary_cooldown=primary_cooldown,
     )
     meta = {
         "draw_rows": len(draws),
@@ -630,6 +637,7 @@ def cmd_daily(args: argparse.Namespace) -> int:
         "recent_window": args.recent_window,
         "min_history": args.min_history,
         "strategy_cache": str(strategy_cache_path),
+        "cooldown_misses": args.cooldown_misses,
     }
     json_path, html_path = save_daily_report(report, args.output_dir, meta)
     output = {
@@ -642,6 +650,7 @@ def cmd_daily(args: argparse.Namespace) -> int:
         "strategy_selection": asdict(report.strategy_selection),
         "confidence_gate": asdict(report.confidence_gate),
         "action_filter": asdict(report.action_filter),
+        "primary_cooldown": asdict(report.primary_cooldown),
     }
     print(json.dumps(output, ensure_ascii=False, indent=2))
     return 0
@@ -940,6 +949,7 @@ def build_parser() -> argparse.ArgumentParser:
     daily.add_argument("--training-window", type=int, default=300)
     daily.add_argument("--recent-window", type=int, default=60)
     daily.add_argument("--min-history", type=int, default=300)
+    daily.add_argument("--cooldown-misses", type=int, default=2)
     daily.add_argument("--output-dir", default="reports/daily")
     daily.set_defaults(func=cmd_daily)
 

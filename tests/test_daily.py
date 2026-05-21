@@ -1,3 +1,4 @@
+import json
 import unittest
 from datetime import date, timedelta
 from pathlib import Path
@@ -13,11 +14,14 @@ if str(SRC) not in sys.path:
 from fuli3d_bot.daily import (  # noqa: E402
     PlayRow,
     PlayStats,
+    PrimaryCooldownRecord,
+    PrimaryCooldownState,
     StrategyCandidate,
     StrategySelection,
     _play_meta,
     _play_payout,
     _play_rows_html,
+    build_primary_cooldown_state,
     build_action_filter,
     _strategy_variants,
     build_confidence_gate,
@@ -112,6 +116,21 @@ def make_strategy_selection(status: str) -> StrategySelection:
     )
 
 
+def write_snapshot(path: Path, issue: str, primary: str) -> None:
+    path.write_text(
+        json.dumps(
+            {
+                "report": {
+                    "next_issue_hint": issue,
+                    "primary": {"number": primary},
+                }
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+
 class DailyTests(unittest.TestCase):
     def test_group_meta_uses_number_pattern(self) -> None:
         zuliu = _play_meta("group", "812")
@@ -156,6 +175,62 @@ class DailyTests(unittest.TestCase):
             snapshot = Path(temp_dir) / "snapshots" / f"prediction_{report.next_issue_hint}.json"
 
             self.assertTrue(snapshot.exists())
+
+    def test_primary_cooldown_detects_two_consecutive_misses(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            predictions = Path(temp_dir) / "snapshots"
+            predictions.mkdir()
+            write_snapshot(predictions / "prediction_2026130.json", "2026130", "812")
+            write_snapshot(predictions / "prediction_2026131.json", "2026131", "812")
+            draws = [
+                Draw("2026130", date(2026, 5, 20), "267"),
+                Draw("2026131", date(2026, 5, 21), "598"),
+            ]
+
+            cooldown = build_primary_cooldown_state(draws, predictions, threshold=2)
+
+            self.assertEqual(cooldown.reviewed_snapshots, 2)
+            self.assertEqual(cooldown.records[0].number, "812")
+            self.assertEqual(cooldown.records[0].consecutive_misses, 2)
+
+    def test_primary_cooldown_moves_repeated_miss_out_of_primary(self) -> None:
+        draws = make_draws(35)
+        base_report = build_daily_report(
+            draws,
+            top_n=5,
+            training_window=30,
+            recent_window=20,
+            min_history=20,
+        )
+        cooldown = PrimaryCooldownState(
+            threshold=2,
+            reviewed_snapshots=2,
+            records=[
+                PrimaryCooldownRecord(
+                    number=base_report.primary.number,
+                    consecutive_misses=2,
+                    last_issue="2026035",
+                    last_actual_number="267",
+                    reason="测试冷却",
+                )
+            ],
+        )
+
+        cooled_report = build_daily_report(
+            draws,
+            top_n=5,
+            training_window=30,
+            recent_window=20,
+            min_history=20,
+            primary_cooldown=cooldown,
+        )
+
+        self.assertNotEqual(cooled_report.primary.number, base_report.primary.number)
+        self.assertIn(
+            base_report.primary.number,
+            [item.number for item in cooled_report.alternatives],
+        )
+        self.assertEqual(cooled_report.action_filter.stake_level, "零")
 
     def test_confidence_gate_blocks_when_direct_recent_fails(self) -> None:
         rows = [
